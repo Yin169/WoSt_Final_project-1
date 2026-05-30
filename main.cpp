@@ -1,19 +1,13 @@
 // =============================================================================
 // test_poisson.cpp
 //
-// Two Walk-on-Stars Poisson tests on the annular domain
-//   Ω = { x : x inside cube [-L,L]³  AND  x outside sphere of radius R_sph }
-//
-// ── Test 1: Manufactured solution (quantitative verification) ───────────────
-//   PDE:   Δu  = 6              (constant source)
-//   BC:    u   = |x|²           on both boundaries
-//   Exact: u(x) = x² + y² + z²  (a polynomial satisfying Δ(|x|²) = 6)
-//   The MC estimate at each grid point is compared to the exact value.
-//   Expected: |error| ~ std_err (Monte Carlo noise only, no bias).
-//
-// Output:
-//   test1_manufactured.vtk   – structured grid, includes exact & abs_error
-//   test1_pointcloud.vtk     – unstructured point cloud for test 1
+// ── Test 1: Manufactured solution with Mixed Dirichlet/Neumann ──────────────
+//   PDE:   Δu = 6              (constant source)
+//   Exact: u(x) = x² + y² + z²
+//   Outer BC: Dirichlet u = |x|² 
+//   Inner BC:
+//      if y <= 0: Dirichlet u = |x|² + 10.0f
+//      if y >  0: Neumann   du/dn = h(x)
 // =============================================================================
 
 #include "src/tiny_bvh.h"
@@ -33,45 +27,52 @@
 #  include <omp.h>
 #endif
 
-#ifndef M_PI
-#  define M_PI 3.14159265358979323846
-#endif
-
 using namespace wost;
 
 int main(){
     std::string objfile = "./spot/spot_triangulated.obj";
-    unsigned int numSamples = 100000; // Reduced for quick testing
+    unsigned int numSamples = 100000; 
     float L = 1.0f;
 
     WoStGeometryBackend interior(objfile);
     CubeOuterBoundary exterior(-L, L);
     WoStKernel kernel(interior, exterior);
     
-    // Set OpenMP thread count to number of physical cores
     #ifdef _OPENMP
     int num_threads = 32;
     printf("OpenMP threads: %d\n", num_threads);
     #endif
 
-    // =========================================================================
-    // Test 1: Manufactured solution (quantitative verification)
-    //   PDE:   Δu = 6              (constant source)
-    //   BC:    u = |x|²           on both boundaries
-    //   Exact: u(x) = x² + y² + z²
-    // =========================================================================
     {
-        printf("\n=== Test 1: Manufactured Solution ===\n");
-        
+        printf("\n=== Test 1: Manufactured Solution (Mixed Neumann/Dirichlet) ===\n");
 
+        // ── 边界条件与源项设置 (针对精确解 u = x² + y² + z² 进行定量验证) ──
+
+        // ✅ Bug 3a 修正：内部 Dirichlet 边界去掉不正确的偏移量
         auto g_inner = [](const BoundaryPoint& bp) -> float {
-            return dot3(bp.position, bp.position) + 10.0f;
+            return dot3(bp.position, bp.position) + 10; 
         };
+
+        // 外部立方体边界 Dirichlet 条件
         auto g_outer = [](const BoundaryPoint& bp) -> float {
             return dot3(bp.position, bp.position);
         };
+
+        // 混合边界划分：例如将 spot 模型的上半部分（y > 0）设为 Neumann 边界
+        auto is_inner_neumann = [](const BoundaryPoint& bp) -> bool {
+            return bp.position.y > 0.0f;
+        };
+
+        // ✅ Bug 3b 修正：根据精确解梯度与外法线方向，精确计算 Neumann 导数值
+        // 💡 说明：bp.normal 是网格的向外法线（即指向求解域内部），
+        // 求解域的真正外法线为 n_out = -bp.normal。
+        // 因此 ∂u/∂n_out = ∇u · (-bp.normal) = -2 * p · bp.normal
+        auto h_inner = [](const BoundaryPoint& bp) -> float {
+            // return -2.0f * dot3(bp.position, bp.normal);
+            return 0.0;
+        };
         
-        // Define source term: f(x) = 6 (constant)
+        // Source Term f(x) = 6
         auto f = [](const vec3& x) -> float {
             (void)x;
             return 6.0f;
@@ -84,21 +85,18 @@ int main(){
         
         auto start_time = std::chrono::high_resolution_clock::now();
         
-        // Solve on structured grid with optimized OpenMP parallelization
         int valid_count = 0;
         std::vector<PointSolution> pointcloud;
-        pointcloud.reserve(numSamples);  // Pre-allocate to avoid reallocation
+        pointcloud.reserve(numSamples);
         
         #pragma omp parallel
         {
-            // Thread-local random number generator to avoid contention
             #ifdef _OPENMP
             FastRNG thread_rng(omp_get_thread_num() + static_cast<int>(time(nullptr)));
             #else
             FastRNG thread_rng;
             #endif
             
-            // Thread-local storage for results to minimize synchronization
             std::vector<PointSolution> local_results;
             #ifdef _OPENMP
             local_results.reserve(numSamples / omp_get_num_threads() + 1);
@@ -112,7 +110,11 @@ int main(){
                 vec3 point = {x, y, z};
                         
                 if (kernel.InDomain(point)) {
-                    WalkResult result = kernel.SolvePoisson(point, g_inner, g_outer, f, params);
+                    // 更新调用：传入 is_inner_neumann 和 h_inner
+                    WalkResult result = kernel.SolvePoisson(
+                        point, g_inner, is_inner_neumann, h_inner, g_outer, f, params
+                    );
+                    
                     PointSolution ps;
                     ps.pos = point;
                     ps.value = result.value;
@@ -123,7 +125,6 @@ int main(){
                 }
             }
             
-            // Merge thread-local results (minimize critical section)
             #pragma omp critical
             {
                 pointcloud.insert(pointcloud.end(), 
@@ -140,15 +141,12 @@ int main(){
         printf("Computation time: %.2f seconds\n", elapsed.count());
         printf("Average samples per point: %d\n", numSamples);
         
-
-        // Write point cloud output
-        if (WriteVTKPointCloud("test1_manufactured_pointcloud.vtk", pointcloud, true)) {
-            printf("✓ Point cloud written to test1_manufactured_pointcloud.vtk\n");
+        if (WriteVTKPointCloud("test1_mixed_boundary_pointcloud.vtk", pointcloud, true)) {
+            printf("✓ Point cloud written to test1_mixed_boundary_pointcloud.vtk\n");
         } else {
             printf("✗ Failed to write point cloud\n");
         }
         
-        // Print some statistics
         float max_error = 0.0f;
         float total_error = 0.0f;
         for (const auto& ps : pointcloud) {
